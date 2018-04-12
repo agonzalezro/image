@@ -380,30 +380,52 @@ func (ic *imageCopier) copyLayers(ctx context.Context) error {
 		srcInfos = updatedSrcInfos
 		srcInfosUpdated = true
 	}
+
+	var (
+		destInfoCh chan types.BlobInfo
+		diffIDCh   chan digest.Digest
+		errCh      chan error
+	)
+
 	for _, srcLayer := range srcInfos {
-		var (
-			destInfo types.BlobInfo
-			diffID   digest.Digest
-			err      error
-		)
-		if ic.c.dest.AcceptsForeignLayerURLs() && len(srcLayer.URLs) != 0 {
-			// DiffIDs are, currently, needed only when converting from schema1.
-			// In which case src.LayerInfos will not have URLs because schema1
-			// does not support them.
-			if ic.diffIDsAreNeeded {
-				return errors.New("getting DiffID for foreign layers is unimplemented")
+		go func(context.Context, types.BlobInfo) {
+			if ic.c.dest.AcceptsForeignLayerURLs() && len(srcLayer.URLs) != 0 {
+				// DiffIDs are, currently, needed only when converting from schema1.
+				// In which case src.LayerInfos will not have URLs because schema1
+				// does not support them.
+				if ic.diffIDsAreNeeded {
+					errCh <- errors.New("getting DiffID for foreign layers is unimplemented")
+					return
+				}
+				destInfoCh <- srcLayer
+				ic.c.Printf("Skipping foreign layer %q copy to %s\n", srcLayer.Digest, ic.c.dest.Reference().Transport().Name())
+			} else {
+				destInfo, diffID, err := ic.copyLayer(ctx, srcLayer)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				destInfoCh <- destInfo
+				diffIDCh <- diffID
 			}
-			destInfo = srcLayer
-			ic.c.Printf("Skipping foreign layer %q copy to %s\n", destInfo.Digest, ic.c.dest.Reference().Transport().Name())
-		} else {
-			destInfo, diffID, err = ic.copyLayer(ctx, srcLayer)
-			if err != nil {
-				return err
-			}
-		}
-		destInfos = append(destInfos, destInfo)
-		diffIDs = append(diffIDs, diffID)
+		}(ctx, srcLayer)
 	}
+
+LOOP:
+	for {
+		select {
+		case v := <-destInfoCh:
+			destInfos = append(destInfos, v)
+			if len(destInfos) == len(srcInfos) {
+				break LOOP
+			}
+		case v := <-diffIDCh:
+			diffIDs = append(diffIDs, v)
+		case err := <-errCh:
+			return err
+		}
+	}
+
 	ic.manifestUpdates.InformationOnly.LayerInfos = destInfos
 	if ic.diffIDsAreNeeded {
 		ic.manifestUpdates.InformationOnly.LayerDiffIDs = diffIDs
